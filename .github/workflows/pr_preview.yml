@@ -290,14 +290,15 @@ jobs:
           UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
-          # Create Redis database via Upstash API
+          # Create Redis database via Upstash API (global DB with primary region)
           RESPONSE=$(curl -s -X POST \
             https://api.upstash.com/v2/redis/database \
             -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{
               "name": "preview-pr-${{ github.event.number }}",
-              "region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
+              "region": "global",
+              "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
               "tls": true
             }')
           

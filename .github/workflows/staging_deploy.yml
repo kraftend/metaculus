@@ -166,13 +166,24 @@ jobs:
           REDIS_NAME="metaculus-staging"
           
           # Check if database already exists
+          echo "Fetching existing databases..."
           DATABASES=$(curl -s -X GET \
             https://api.upstash.com/v2/redis/databases \
             -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
           
-          EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")")
+          # Debug: Check if response is valid JSON array
+          if ! echo "$DATABASES" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "⚠️ Unexpected response from Upstash API:"
+            echo "$DATABASES" | head -c 500
+            echo ""
+            echo "Assuming no existing database, will create new one..."
+            EXISTING_DB=""
+          else
+            # Search for existing database by name
+            EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")" 2>/dev/null || echo "")
+          fi
           
-          if [ -n "$EXISTING_DB" ]; then
+          if [ -n "$EXISTING_DB" ] && [ "$EXISTING_DB" != "null" ]; then
             echo "✅ Found existing Redis database: ${REDIS_NAME}"
             DATABASE_ID=$(echo "$EXISTING_DB" | jq -r '.database_id')
             ENDPOINT=$(echo "$EXISTING_DB" | jq -r '.endpoint')
@@ -180,20 +191,26 @@ jobs:
             PASSWORD=$(echo "$EXISTING_DB" | jq -r '.password')
           else
             echo "Creating new Redis database: ${REDIS_NAME}"
+            # Upstash now requires global database with primary_region
             RESPONSE=$(curl -s -X POST \
               https://api.upstash.com/v2/redis/database \
               -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
               -H "Content-Type: application/json" \
               -d '{
                 "name": "'"${REDIS_NAME}"'",
-                "region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
+                "region": "global",
+                "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
                 "tls": true
               }')
+            
+            # Debug: Print response structure (mask password if present)
+            echo "📋 Create response received:"
+            echo "$RESPONSE" | jq 'if .password then .password = "***MASKED***" else . end' 2>/dev/null || echo "$RESPONSE"
             
             # Check for errors
             if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
               echo "❌ Failed to create Redis database:"
-              echo "$RESPONSE" | jq '.error'
+              echo "$RESPONSE" | jq '.'
               exit 1
             fi
             
@@ -201,7 +218,18 @@ jobs:
             ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
             PORT=$(echo "$RESPONSE" | jq -r '.port')
             PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+            
             echo "✅ Created new Redis database: ${REDIS_NAME}"
+            echo "   database_id: ${DATABASE_ID}"
+            echo "   endpoint: ${ENDPOINT}"
+            echo "   port: ${PORT}"
+            echo "   password: ${PASSWORD:+***SET***}"
+          fi
+          
+          # Validate we got the required values
+          if [ -z "$DATABASE_ID" ] || [ "$DATABASE_ID" == "null" ]; then
+            echo "❌ Failed to get database_id"
+            exit 1
           fi
           
           # Construct Redis URL
