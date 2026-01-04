@@ -199,7 +199,8 @@ jobs:
           
           # Construct Redis URL and set as step output
           REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
-          echo "redis_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          echo "redis_cache_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          echo "redis_mq_url=${REDIS_URL}" >> $GITHUB_OUTPUT
 
       - name: Deploy to staging
         id: deploy
@@ -225,7 +226,8 @@ jobs:
             APP_DOMAIN="${APP_DOMAIN}" \
             PUBLIC_APP_URL="${PUBLIC_APP_URL}" \
             DATABASE_URL="${{ steps.neon.outputs.db_url_with_pooler }}" \
-            REDIS_URL="${{ steps.redis.outputs.redis_url }}" \
+            REDIS_CACHE_URL="${{ steps.redis.outputs.redis_cache_url }}" \
+            REDIS_MQ_URL="${{ steps.redis.outputs.redis_mq_url }}" \
             --app ${{ env.STAGING_APP_NAME }} \
             --stage
 
