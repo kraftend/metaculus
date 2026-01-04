@@ -1,0 +1,676 @@
+# =============================================================================
+# PR Preview Environment Workflow
+# =============================================================================
+#
+# This workflow creates ephemeral preview environments for pull requests:
+# 1. Builds Docker image and pushes to GitHub Container Registry (ghcr.io)
+# 2. Creates a NeonDB database branch for isolated PostgreSQL
+# 3. Creates an Upstash Redis database for isolated caching
+# 4. Deploys the preview app to Fly.io
+# 5. Cleans up resources when PR is closed
+#
+# SECURITY:
+# ---------
+# - Internal PRs (from the same repo): Deploy automatically
+# - Fork PRs (external contributors): Require "preview" label from maintainer
+#
+# This prevents external contributors from:
+# - Accessing repository secrets
+# - Deploying potentially malicious code
+# - Consuming cloud resources without approval
+#
+# Required Secrets:
+# -----------------
+# - NEON_PROJECT_ID: Your Neon project ID (found in Neon Console project settings)
+# - NEON_API_KEY: API key from Neon Console (https://console.neon.tech/app/settings/api-keys)
+# - FLY_API_TOKEN: API token from Fly.io (run `fly tokens create deploy`)
+# - UPSTASH_EMAIL: Email for Upstash account
+# - UPSTASH_API_KEY: API key from Upstash Console (https://console.upstash.com/account/api)
+# - FLY_PREVIEW_SECRETS: Multi-line secret containing all app secrets in KEY=value format
+#     Example:
+#       SECRET_KEY=django-secret-key-here
+#       OPENAI_API_KEY=sk-xxx
+#       SENTRY_DSN=https://xxx@sentry.io/xxx
+#       MAILGUN_API_KEY=xxx
+#
+# Optional Variables:
+# -------------------
+# - FLY_ORG: Fly.io organization (defaults to 'personal')
+# - FLY_REGION: Fly.io region for deployment (defaults to 'iad')
+# - UPSTASH_REGION: Upstash Redis region (defaults to 'us-east-1')
+# =============================================================================
+
+name: PR Preview Environment
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - closed
+
+concurrency:
+  group: pr-preview-${{ github.event.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+  deployments: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+  # Label required for fork PRs (security measure for external contributors)
+  PREVIEW_LABEL: "preview"
+
+jobs:
+  # ===========================================================================
+  # Security Check - Determine if PR can proceed with deployment
+  # ===========================================================================
+  security-check:
+    name: Security Check
+    runs-on: ubuntu-latest
+    outputs:
+      # PR is approved if: (1) it's NOT from a fork, OR (2) it has the preview label
+      is_approved: ${{ steps.evaluate.outputs.is_approved }}
+      is_fork: ${{ steps.check_fork.outputs.is_fork }}
+      has_label: ${{ steps.check_label.outputs.has_label }}
+    steps:
+      - name: Check if PR is from a fork
+        id: check_fork
+        run: |
+          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "is_fork=true" >> $GITHUB_OUTPUT
+            echo "⚠️ This PR is from a fork: ${{ github.event.pull_request.head.repo.full_name }}"
+          else
+            echo "is_fork=false" >> $GITHUB_OUTPUT
+            echo "✅ This PR is from the same repository"
+          fi
+
+      - name: Check for preview label
+        id: check_label
+        run: |
+          HAS_LABEL="${{ contains(github.event.pull_request.labels.*.name, env.PREVIEW_LABEL) }}"
+          echo "has_label=${HAS_LABEL}" >> $GITHUB_OUTPUT
+          if [ "${HAS_LABEL}" == "true" ]; then
+            echo "✅ PR has the '${{ env.PREVIEW_LABEL }}' label"
+          else
+            echo "ℹ️ PR does not have the '${{ env.PREVIEW_LABEL }}' label"
+          fi
+
+      - name: Evaluate approval status
+        id: evaluate
+        run: |
+          IS_FORK="${{ steps.check_fork.outputs.is_fork }}"
+          HAS_LABEL="${{ steps.check_label.outputs.has_label }}"
+          
+          # Approved if: NOT a fork, OR has the preview label
+          if [ "${IS_FORK}" == "false" ] || [ "${HAS_LABEL}" == "true" ]; then
+            echo "is_approved=true" >> $GITHUB_OUTPUT
+            echo "✅ PR is approved for preview deployment"
+          else
+            echo "is_approved=false" >> $GITHUB_OUTPUT
+            echo "⏸️ Fork PR requires '${{ env.PREVIEW_LABEL }}' label from maintainer"
+          fi
+
+      - name: Post guidance comment for fork PRs without label
+        if: |
+          github.event.action != 'closed' &&
+          github.event.action != 'unlabeled' &&
+          steps.check_fork.outputs.is_fork == 'true' &&
+          steps.check_label.outputs.has_label != 'true'
+        uses: peter-evans/find-comment@v3
+        id: find_guidance
+        with:
+          issue-number: ${{ github.event.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '⏸️ Preview Environment Pending'
+
+      - name: Create guidance comment for fork PRs
+        if: |
+          github.event.action != 'closed' &&
+          github.event.action != 'unlabeled' &&
+          steps.check_fork.outputs.is_fork == 'true' &&
+          steps.check_label.outputs.has_label != 'true' &&
+          steps.find_guidance.outputs.comment-id == ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.number }}
+          body: |
+            ## ⏸️ Preview Environment Pending
+
+            This PR is from a fork and requires the **`${{ env.PREVIEW_LABEL }}`** label to trigger a preview deployment.
+
+            **Why?** For security, preview environments for fork PRs are only created after a maintainer reviews and approves the code.
+
+            ---
+            <details>
+            <summary>For Maintainers</summary>
+
+            To deploy a preview environment for this fork PR:
+            1. Review the PR changes for security concerns
+            2. Add the `${{ env.PREVIEW_LABEL }}` label to trigger the deployment
+            3. The preview will be automatically destroyed when the PR is closed
+
+            </details>
+
+  # ===========================================================================
+  # Setup Job - Get branch name and PR info
+  # ===========================================================================
+  setup:
+    name: Setup
+    needs: security-check
+    if: |
+      needs.security-check.outputs.is_approved == 'true' ||
+      github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch_name.outputs.current_branch }}
+      short_sha: ${{ steps.short_sha.outputs.sha }}
+      image_tag: ${{ steps.image_tag.outputs.tag }}
+    steps:
+      - name: Get branch name
+        id: branch_name
+        uses: tj-actions/branch-names@v8
+
+      - name: Get short SHA
+        id: short_sha
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Generate image tag
+        id: image_tag
+        run: echo "tag=pr-${{ github.event.number }}-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Build Docker Image - Build and push to GitHub Container Registry
+  # ===========================================================================
+  build-image:
+    name: Build Docker Image
+    needs: [security-check, setup]
+    if: |
+      github.event.action != 'closed' &&
+      needs.security-check.outputs.is_approved == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      image_url: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Mutable tag - always points to latest build for this PR
+            type=raw,value=pr-${{ github.event.number }}
+            # Immutable tag - unique per commit (for rollbacks/debugging)
+            type=raw,value=${{ needs.setup.outputs.image_tag }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: all_runners
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+  # ===========================================================================
+  # Create NeonDB Branch - Create isolated PostgreSQL database for this PR
+  # ===========================================================================
+  create-neon-branch:
+    name: Create NeonDB Branch
+    needs: [security-check, setup]
+    if: |
+      github.event.action != 'closed' &&
+      needs.security-check.outputs.is_approved == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      db_url: ${{ steps.create_branch.outputs.db_url }}
+      db_url_with_pooler: ${{ steps.create_branch.outputs.db_url_with_pooler }}
+      branch_id: ${{ steps.create_branch.outputs.branch_id }}
+    steps:
+      - name: Create Neon Branch
+        id: create_branch
+        uses: neondatabase/create-branch-action@v5
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch_name: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          username: neondb_owner
+          # Uses the default parent branch (usually 'main')
+          # Uncomment below to specify a different parent:
+          # parent: main
+
+      - name: Log branch creation (no sensitive data)
+        run: |
+          echo "✅ Created Neon branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}"
+          echo "Branch ID: ${{ steps.create_branch.outputs.branch_id }}"
+
+  # ===========================================================================
+  # Create Upstash Redis - Create isolated Redis database for this PR
+  # ===========================================================================
+  create-upstash-redis:
+    name: Create Upstash Redis
+    needs: [security-check, setup]
+    if: |
+      github.event.action != 'closed' &&
+      needs.security-check.outputs.is_approved == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      redis_url: ${{ steps.create_redis.outputs.redis_url }}
+      database_id: ${{ steps.create_redis.outputs.database_id }}
+    steps:
+      - name: Create Upstash Redis Database
+        id: create_redis
+        env:
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          # Create Redis database via Upstash API
+          RESPONSE=$(curl -s -X POST \
+            https://api.upstash.com/v2/redis/database \
+            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "preview-pr-${{ github.event.number }}",
+              "region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
+              "tls": true
+            }')
+          
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ Failed to create Redis database:"
+            echo "$RESPONSE" | jq '.error'
+            exit 1
+          fi
+          
+          # Extract database details
+          DATABASE_ID=$(echo "$RESPONSE" | jq -r '.database_id')
+          ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
+          PORT=$(echo "$RESPONSE" | jq -r '.port')
+          PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+          
+          # Construct Redis URL
+          REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
+          
+          # Set outputs (mask the password)
+          echo "::add-mask::${PASSWORD}"
+          echo "::add-mask::${REDIS_URL}"
+          echo "database_id=${DATABASE_ID}" >> $GITHUB_OUTPUT
+          echo "redis_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Created Upstash Redis database: preview-pr-${{ github.event.number }}"
+          echo "Database ID: ${DATABASE_ID}"
+          echo "Endpoint: ${ENDPOINT}"
+
+  # ===========================================================================
+  # Deploy to Fly.io - Deploy preview app with the built image
+  # ===========================================================================
+  deploy-preview:
+    name: Deploy Preview App
+    needs: [security-check, setup, build-image, create-neon-branch, create-upstash-redis]
+    if: |
+      github.event.action != 'closed' &&
+      needs.security-check.outputs.is_approved == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pr-${{ github.event.number }}
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+      app_name: ${{ steps.app_name.outputs.name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate app name
+        id: app_name
+        run: |
+          # Fly.io app names must be lowercase, alphanumeric with hyphens
+          # Max 63 characters
+          APP_NAME="metaculus-pr-${{ github.event.number }}"
+          echo "name=${APP_NAME}" >> $GITHUB_OUTPUT
+          echo "App name: ${APP_NAME}"
+
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Create or update Fly app
+        id: deploy
+        run: |
+          # Check if app exists, create if not
+          if ! flyctl apps list | grep -q "${{ steps.app_name.outputs.name }}"; then
+            echo "Creating new Fly app: ${{ steps.app_name.outputs.name }}"
+            flyctl apps create ${{ steps.app_name.outputs.name }} \
+              --org ${{ vars.FLY_ORG || 'personal' }}
+          fi
+
+          # Define app URLs (used for secrets and outputs)
+          APP_DOMAIN="${{ steps.app_name.outputs.name }}.fly.dev"
+          PUBLIC_APP_URL="https://${APP_DOMAIN}"
+
+          # Set secrets for the app (these are encrypted at rest)
+          # Dynamic secrets (generated per-PR) are set individually
+          # Static secrets are imported from FLY_PREVIEW_SECRETS (one multi-line GitHub secret)
+          
+          # Import static secrets from GitHub secret (KEY=value format, one per line)
+          echo "${{ secrets.FLY_PREVIEW_SECRETS }}" | flyctl secrets import \
+            --app ${{ steps.app_name.outputs.name }} \
+            --stage
+          
+          # Set dynamic secrets (unique per PR - URLs and database connections)
+          flyctl secrets set \
+            DATABASE_URL="${{ needs.create-neon-branch.outputs.db_url_with_pooler }}" \
+            REDIS_URL="${{ needs.create-upstash-redis.outputs.redis_url }}" \
+            APP_DOMAIN="${APP_DOMAIN}" \
+            PUBLIC_APP_URL="${PUBLIC_APP_URL}" \
+            --app ${{ steps.app_name.outputs.name }} \
+            --stage
+
+          # Deploy using the pre-built image
+          # VM memory/cpu settings are defined per-process in fly.toml
+          flyctl deploy \
+            --app ${{ steps.app_name.outputs.name }} \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }} \
+            --region ${{ vars.FLY_REGION || 'iad' }} \
+            --ha=false \
+            --now
+
+          # Scale processes based on PR labels
+          # By default, only run app process in previews (worker/cron are expensive and rarely needed)
+          WORKER_COUNT=0
+          CRON_COUNT=0
+          
+          # Check for preview-worker label
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+            WORKER_COUNT=1
+            echo "📦 preview-worker label detected - scaling worker to 1"
+          fi
+          
+          # Check for preview-cron label
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
+            CRON_COUNT=1
+            echo "⏰ preview-cron label detected - scaling cron to 1"
+          fi
+          
+          echo "Scaling processes: app=1, worker=${WORKER_COUNT}, cron=${CRON_COUNT}"
+          flyctl scale count app=1 worker=${WORKER_COUNT} cron=${CRON_COUNT} \
+            --app ${{ steps.app_name.outputs.name }} \
+            --yes
+
+          # Output the app URL for other jobs
+          echo "url=${PUBLIC_APP_URL}" >> $GITHUB_OUTPUT
+          echo "✅ Deployed to: ${PUBLIC_APP_URL}"
+
+  # ===========================================================================
+  # Post Deployment Comment - Add comment to PR with preview URLs
+  # ===========================================================================
+  comment-on-pr:
+    name: Comment on PR
+    needs: [security-check, setup, deploy-preview, create-neon-branch, create-upstash-redis]
+    if: |
+      github.event.action != 'closed' &&
+      needs.security-check.outputs.is_approved == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find_comment
+        with:
+          issue-number: ${{ github.event.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'Preview Environment'
+
+      - name: Determine process status
+        id: process_status
+        run: |
+          # Check labels for worker/cron
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+            echo "worker=✅ Running" >> $GITHUB_OUTPUT
+          else
+            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
+          fi
+          
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
+            echo "cron=✅ Running" >> $GITHUB_OUTPUT
+          else
+            echo "cron=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create or update comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.number }}
+          edit-mode: replace
+          body: |
+            ## 🚀 Preview Environment
+
+            Your preview environment is ready!
+
+            | Resource | Details |
+            |----------|---------|
+            | 🌐 **Preview App** | ${{ needs.deploy-preview.outputs.url }} |
+            | 📦 **Docker Image** | `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}` |
+            | 🗄️ **PostgreSQL** | NeonDB branch `preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}` |
+            | ⚡ **Redis** | Upstash `preview-pr-${{ github.event.number }}` |
+
+            ### Processes
+            | Process | Status |
+            |---------|--------|
+            | 🌐 **app** (web server) | ✅ Running |
+            | 📦 **worker** (background jobs) | ${{ steps.process_status.outputs.worker }} |
+            | ⏰ **cron** (scheduled tasks) | ${{ steps.process_status.outputs.cron }} |
+
+            ### Details
+            - **Commit:** ${{ github.sha }}
+            - **Branch:** `${{ needs.setup.outputs.branch }}`
+            - **Fly App:** `${{ needs.deploy-preview.outputs.app_name }}`
+
+            ---
+            <details>
+            <summary>ℹ️ Preview Environment Info</summary>
+
+            - The preview app will be automatically destroyed when this PR is closed
+            - Both PostgreSQL and Redis are isolated from production data
+            - Changes pushed to this PR will trigger a new deployment
+            - To enable background workers, add the `preview-worker` label
+            - To enable cron jobs, add the `preview-cron` label
+
+            </details>
+
+  # ===========================================================================
+  # Cleanup - Delete preview resources when PR is closed
+  # ===========================================================================
+  cleanup-preview:
+    name: Cleanup Preview Resources
+    needs: setup
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Delete Fly app
+        continue-on-error: true
+        run: |
+          APP_NAME="metaculus-pr-${{ github.event.number }}"
+          echo "Deleting Fly app: ${APP_NAME}"
+          flyctl apps destroy ${APP_NAME} --yes || echo "App may not exist or already deleted"
+
+      - name: Delete Neon Branch
+        continue-on-error: true
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+      - name: Delete Upstash Redis Database
+        continue-on-error: true
+        env:
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          # First, list databases to find the one for this PR
+          DATABASES=$(curl -s -X GET \
+            https://api.upstash.com/v2/redis/databases \
+            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          
+          # Find database ID by name
+          DATABASE_ID=$(echo "$DATABASES" | jq -r '.[] | select(.database_name == "preview-pr-${{ github.event.number }}") | .database_id')
+          
+          if [ -n "$DATABASE_ID" ] && [ "$DATABASE_ID" != "null" ]; then
+            echo "Deleting Upstash Redis database: preview-pr-${{ github.event.number }} (ID: ${DATABASE_ID})"
+            curl -s -X DELETE \
+              "https://api.upstash.com/v2/redis/database/${DATABASE_ID}" \
+              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}"
+            echo "✅ Deleted Upstash Redis database"
+          else
+            echo "ℹ️ Upstash Redis database not found or already deleted"
+          fi
+
+      - name: Delete GitHub Environment
+        uses: strumwolf/delete-deployment-environment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: pr-${{ github.event.number }}
+
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find_comment
+        with:
+          issue-number: ${{ github.event.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'Preview Environment'
+
+      - name: Update comment to show cleanup
+        if: steps.find_comment.outputs.comment-id != ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            ## 🧹 Preview Environment Cleaned Up
+
+            The preview environment for this PR has been destroyed.
+
+            | Resource | Status |
+            |----------|--------|
+            | 🌐 Preview App | ✅ Deleted |
+            | 🗄️ PostgreSQL Branch | ✅ Deleted |
+            | ⚡ Redis Database | ✅ Deleted |
+            | 🔧 GitHub Environment | ✅ Deleted |
+            | 📦 Docker Image | ⚠️ Retained (auto-cleanup via GHCR policies) |
+
+            ---
+            *Cleanup triggered by PR close at ${{ github.event.pull_request.closed_at || 'N/A' }}*
+
+  # ===========================================================================
+  # Handle Label Removal - Cleanup if preview label is removed from fork PR
+  # ===========================================================================
+  handle-label-removal:
+    name: Handle Label Removal
+    needs: security-check
+    if: |
+      github.event.action == 'unlabeled' &&
+      github.event.label.name == 'preview' &&
+      needs.security-check.outputs.is_fork == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Get branch name
+        id: branch_name
+        uses: tj-actions/branch-names@v8
+
+      - name: Delete Fly app
+        continue-on-error: true
+        run: |
+          APP_NAME="metaculus-pr-${{ github.event.number }}"
+          echo "Label removed from fork PR - Deleting Fly app: ${APP_NAME}"
+          flyctl apps destroy ${APP_NAME} --yes || echo "App may not exist or already deleted"
+
+      - name: Delete Neon Branch
+        continue-on-error: true
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch: preview/pr-${{ github.event.number }}-${{ steps.branch_name.outputs.current_branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+
+      - name: Delete Upstash Redis Database
+        continue-on-error: true
+        env:
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          # First, list databases to find the one for this PR
+          DATABASES=$(curl -s -X GET \
+            https://api.upstash.com/v2/redis/databases \
+            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          
+          # Find database ID by name
+          DATABASE_ID=$(echo "$DATABASES" | jq -r '.[] | select(.database_name == "preview-pr-${{ github.event.number }}") | .database_id')
+          
+          if [ -n "$DATABASE_ID" ] && [ "$DATABASE_ID" != "null" ]; then
+            echo "Deleting Upstash Redis database: preview-pr-${{ github.event.number }} (ID: ${DATABASE_ID})"
+            curl -s -X DELETE \
+              "https://api.upstash.com/v2/redis/database/${DATABASE_ID}" \
+              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}"
+            echo "✅ Deleted Upstash Redis database"
+          else
+            echo "ℹ️ Upstash Redis database not found or already deleted"
+          fi
+
+      - name: Delete GitHub Environment
+        uses: strumwolf/delete-deployment-environment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: pr-${{ github.event.number }}
+
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find_comment
+        with:
+          issue-number: ${{ github.event.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'Preview Environment'
+
+      - name: Update comment
+        if: steps.find_comment.outputs.comment-id != ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          edit-mode: replace
+          body: |
+            ## ⏹️ Preview Environment Removed
+
+            The `preview` label was removed from this fork PR, so the preview environment has been destroyed.
+
+            To redeploy, a maintainer can add the `preview` label again.

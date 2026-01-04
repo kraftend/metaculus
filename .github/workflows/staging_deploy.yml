@@ -1,0 +1,303 @@
+# =============================================================================
+# Staging Environment Deployment
+# =============================================================================
+#
+# This workflow deploys to a persistent staging environment on every push to main.
+# Unlike PR previews, staging:
+# - Uses a fixed app name (metaculus-staging)
+# - Runs all processes (app, worker, cron)
+# - Uses NeonDB main branch (not ephemeral branch)
+# - Creates/reuses a persistent Upstash Redis database
+# - Never auto-stops machines
+#
+# Required Secrets:
+# -----------------
+# - FLY_API_TOKEN: API token from Fly.io (run `fly tokens create deploy`)
+# - FLY_STAGING_SECRETS: Multi-line secret containing all app secrets in KEY=value format
+#     Example:
+#       SECRET_KEY=django-secret-key-here
+#       OPENAI_API_KEY=sk-xxx
+#       SENTRY_DSN=https://xxx@sentry.io/xxx
+# - NEON_PROJECT_ID: Your Neon project ID
+# - NEON_API_KEY: API key from Neon Console
+# - UPSTASH_EMAIL: Email for Upstash account
+# - UPSTASH_API_KEY: API key from Upstash Console
+#
+# Optional Variables:
+# -------------------
+# - FLY_ORG: Fly.io organization (defaults to 'personal')
+# - FLY_REGION: Fly.io region for deployment (defaults to 'iad')
+# - STAGING_APP_NAME: Fly app name (defaults to 'metaculus-staging')
+# - UPSTASH_REGION: Upstash Redis region (defaults to 'us-east-1')
+# =============================================================================
+
+name: Staging Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+  STAGING_APP_NAME: ${{ vars.STAGING_APP_NAME || 'metaculus-staging' }}
+
+jobs:
+  # ===========================================================================
+  # Setup Job - Get commit info
+  # ===========================================================================
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.short_sha.outputs.sha }}
+      image_tag: ${{ steps.image_tag.outputs.tag }}
+    steps:
+      - name: Get short SHA
+        id: short_sha
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Generate image tag
+        id: image_tag
+        run: echo "tag=main-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Build Docker Image
+  # ===========================================================================
+  build-image:
+    name: Build Docker Image
+    needs: setup
+    runs-on: ubuntu-24.04
+    outputs:
+      image_url: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Mutable tag - always points to latest staging build
+            type=raw,value=latest
+            # Immutable tag - unique per commit (for rollbacks)
+            type=raw,value=${{ needs.setup.outputs.image_tag }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          target: all_runners
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+  # ===========================================================================
+  # Get NeonDB Main Branch - Get connection string for main branch
+  # ===========================================================================
+  get-neon-main:
+    name: Get NeonDB Main Branch
+    needs: setup
+    runs-on: ubuntu-latest
+    outputs:
+      db_url: ${{ steps.neon_branch.outputs.db_url }}
+      db_url_with_pooler: ${{ steps.neon_branch.outputs.db_url_with_pooler }}
+      branch_id: ${{ steps.neon_branch.outputs.branch_id }}
+    steps:
+      - name: Get Neon Main Branch
+        id: neon_branch
+        uses: neondatabase/create-branch-action@v5
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID }}
+          branch_name: main
+          api_key: ${{ secrets.NEON_API_KEY }}
+          username: neondb_owner
+
+      - name: Log branch info
+        run: |
+          echo "✅ Using NeonDB main branch"
+          echo "Branch ID: ${{ steps.neon_branch.outputs.branch_id }}"
+
+  # ===========================================================================
+  # Create/Reuse Upstash Redis - Persistent Redis for staging
+  # ===========================================================================
+  setup-upstash-redis:
+    name: Setup Upstash Redis
+    needs: setup
+    runs-on: ubuntu-latest
+    outputs:
+      redis_url: ${{ steps.setup_redis.outputs.redis_url }}
+      database_id: ${{ steps.setup_redis.outputs.database_id }}
+    steps:
+      - name: Create or Reuse Upstash Redis Database
+        id: setup_redis
+        env:
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          REDIS_NAME="metaculus-staging"
+          
+          # Check if database already exists
+          DATABASES=$(curl -s -X GET \
+            https://api.upstash.com/v2/redis/databases \
+            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          
+          EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")")
+          
+          if [ -n "$EXISTING_DB" ]; then
+            echo "✅ Found existing Redis database: ${REDIS_NAME}"
+            DATABASE_ID=$(echo "$EXISTING_DB" | jq -r '.database_id')
+            ENDPOINT=$(echo "$EXISTING_DB" | jq -r '.endpoint')
+            PORT=$(echo "$EXISTING_DB" | jq -r '.port')
+            PASSWORD=$(echo "$EXISTING_DB" | jq -r '.password')
+          else
+            echo "Creating new Redis database: ${REDIS_NAME}"
+            RESPONSE=$(curl -s -X POST \
+              https://api.upstash.com/v2/redis/database \
+              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "'"${REDIS_NAME}"'",
+                "region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
+                "tls": true
+              }')
+            
+            # Check for errors
+            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              echo "❌ Failed to create Redis database:"
+              echo "$RESPONSE" | jq '.error'
+              exit 1
+            fi
+            
+            DATABASE_ID=$(echo "$RESPONSE" | jq -r '.database_id')
+            ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
+            PORT=$(echo "$RESPONSE" | jq -r '.port')
+            PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+            echo "✅ Created new Redis database: ${REDIS_NAME}"
+          fi
+          
+          # Construct Redis URL
+          REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
+          
+          # Mask sensitive data and set outputs
+          echo "::add-mask::${PASSWORD}"
+          echo "::add-mask::${REDIS_URL}"
+          echo "database_id=${DATABASE_ID}" >> $GITHUB_OUTPUT
+          echo "redis_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          
+          echo "Database ID: ${DATABASE_ID}"
+          echo "Endpoint: ${ENDPOINT}"
+
+  # ===========================================================================
+  # Deploy to Fly.io Staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy Staging
+    needs: [setup, build-image, get-neon-main, setup-upstash-redis]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to staging
+        id: deploy
+        run: |
+          # Define app URLs
+          APP_DOMAIN="${{ env.STAGING_APP_NAME }}.fly.dev"
+          PUBLIC_APP_URL="https://${APP_DOMAIN}"
+
+          # Check if app exists, create if not
+          if ! flyctl apps list | grep -q "${{ env.STAGING_APP_NAME }}"; then
+            echo "Creating new Fly app: ${{ env.STAGING_APP_NAME }}"
+            flyctl apps create ${{ env.STAGING_APP_NAME }} \
+              --org ${{ vars.FLY_ORG || 'personal' }}
+          fi
+
+          # Import static secrets from FLY_STAGING_SECRETS
+          echo "${{ secrets.FLY_STAGING_SECRETS }}" | flyctl secrets import \
+            --app ${{ env.STAGING_APP_NAME }} \
+            --stage
+          
+          # Set dynamic secrets (URLs, database, redis)
+          flyctl secrets set \
+            APP_DOMAIN="${APP_DOMAIN}" \
+            PUBLIC_APP_URL="${PUBLIC_APP_URL}" \
+            DATABASE_URL="${{ needs.get-neon-main.outputs.db_url_with_pooler }}" \
+            REDIS_URL="${{ needs.setup-upstash-redis.outputs.redis_url }}" \
+            --app ${{ env.STAGING_APP_NAME }} \
+            --stage
+
+          # Deploy using the pre-built image
+          # VM memory/cpu settings are defined per-process in fly.toml
+          flyctl deploy \
+            --app ${{ env.STAGING_APP_NAME }} \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }} \
+            --region ${{ vars.FLY_REGION || 'iad' }} \
+            --ha=false \
+            --now
+
+          # Scale all processes for staging (app, worker, cron all running)
+          echo "Scaling processes: app=1, worker=1, cron=1"
+          flyctl scale count app=1 worker=1 cron=1 \
+            --app ${{ env.STAGING_APP_NAME }} \
+            --yes
+
+          # Output the app URL
+          echo "url=${PUBLIC_APP_URL}" >> $GITHUB_OUTPUT
+          echo "✅ Deployed staging to: ${PUBLIC_APP_URL}"
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 Staging Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 **URL** | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🗄️ **PostgreSQL** | NeonDB main branch |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚡ **Redis** | Upstash \`metaculus-staging\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔖 **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Processes" >> $GITHUB_STEP_SUMMARY
+          echo "| Process | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 **app** | ✅ Running |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 **worker** | ✅ Running |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏰ **cron** | ✅ Running |" >> $GITHUB_STEP_SUMMARY
+

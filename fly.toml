@@ -1,0 +1,63 @@
+# Fly.io configuration for Metaculus preview deployments
+# This file is used for PR preview environments
+# See: https://fly.io/docs/reference/configuration/
+
+app = "metaculus-preview"
+primary_region = "iad"
+
+[build]
+  # We use a pre-built Docker image from GitHub Container Registry
+  # The image is specified via --image flag during deploy
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+  GUNICORN_WORKERS = "4"
+  NODE_INSTANCES = "1"
+  NODE_HEAP_SIZE = "1024"
+  DRAMATIQ_PROCESSES = "4"
+  DRAMATIQ_THREADS = "4"
+  AUTH_SIGNUP_VERIFY_EMAIL = "True"
+  DRAMATIQ_PROCESSES       = "4"
+  DRAMATIQ_THREADS         = "4"
+  PUBLIC_ALLOW_SIGNUP      = "true"
+  PUBLIC_ALLOW_TUTORIAL    = "true"
+  PUBLIC_DISALLOW_ALL_BOTS = "true"
+  PUBLIC_MINIMAL_UI        = "false"
+  EMAIL_ALLOW_SEND_TO_ALL_USERS = "false"
+  MAIL_FREQUENCY_MIN       = "0"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[processes]
+  app = "scripts/prod/startapp.sh"
+  worker = "scripts/prod/run_dramatiq.sh"
+  cron = "scripts/prod/django_cron.sh"
+
+# VM configuration per process group
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2
+  processes = ["app"]
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["worker"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["cron"]
+
+[deploy]
+  release_command = "scripts/prod/release.sh"
