@@ -238,53 +238,48 @@ jobs:
             BUILDKIT_INLINE_CACHE=1
 
   # ===========================================================================
-  # Create NeonDB Branch - Create isolated PostgreSQL database for this PR
+  # Deploy to Fly.io - Deploy preview app with the built image
   # ===========================================================================
-  create-neon-branch:
-    name: Create NeonDB Branch
-    needs: [security-check, setup]
+  deploy-preview:
+    name: Deploy Preview App
+    needs: [security-check, setup, build-image]
     if: |
       github.event.action != 'closed' &&
       needs.security-check.outputs.is_approved == 'true'
     runs-on: ubuntu-latest
+    environment:
+      name: pr-${{ github.event.number }}
+      url: ${{ steps.deploy.outputs.url }}
     outputs:
-      db_url: ${{ steps.create_branch.outputs.db_url }}
-      db_url_with_pooler: ${{ steps.create_branch.outputs.db_url_with_pooler }}
-      branch_id: ${{ steps.create_branch.outputs.branch_id }}
+      url: ${{ steps.deploy.outputs.url }}
+      app_name: ${{ steps.app_name.outputs.name }}
     steps:
-      - name: Create Neon Branch
-        id: create_branch
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate app name
+        id: app_name
+        run: |
+          # Fly.io app names must be lowercase, alphanumeric with hyphens
+          # Max 63 characters
+          APP_NAME="metaculus-pr-${{ github.event.number }}"
+          echo "name=${APP_NAME}" >> $GITHUB_OUTPUT
+          echo "App name: ${APP_NAME}"
+
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Create NeonDB Branch
+        id: neon
         uses: neondatabase/create-branch-action@v5
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID }}
           branch_name: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
           api_key: ${{ secrets.NEON_API_KEY }}
           username: neondb_owner
-          # Uses the default parent branch (usually 'main')
-          # Uncomment below to specify a different parent:
-          # parent: main
 
-      - name: Log branch creation (no sensitive data)
-        run: |
-          echo "✅ Created Neon branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}"
-          echo "Branch ID: ${{ steps.create_branch.outputs.branch_id }}"
-
-  # ===========================================================================
-  # Create Upstash Redis - Create isolated Redis database for this PR
-  # ===========================================================================
-  create-upstash-redis:
-    name: Create Upstash Redis
-    needs: [security-check, setup]
-    if: |
-      github.event.action != 'closed' &&
-      needs.security-check.outputs.is_approved == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      redis_url: ${{ steps.create_redis.outputs.redis_url }}
-      database_id: ${{ steps.create_redis.outputs.database_id }}
-    steps:
       - name: Create Upstash Redis Database
-        id: create_redis
+        id: redis
         env:
           UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
@@ -314,50 +309,14 @@ jobs:
           PORT=$(echo "$RESPONSE" | jq -r '.port')
           PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
           
-          # Construct Redis URL
+          # Construct Redis URL and set as step output
           REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
-          
-          # Set outputs (mask the password)
-          echo "::add-mask::${PASSWORD}"
-          echo "::add-mask::${REDIS_URL}"
           echo "database_id=${DATABASE_ID}" >> $GITHUB_OUTPUT
           echo "redis_url=${REDIS_URL}" >> $GITHUB_OUTPUT
           
           echo "✅ Created Upstash Redis database: preview-pr-${{ github.event.number }}"
           echo "Database ID: ${DATABASE_ID}"
           echo "Endpoint: ${ENDPOINT}"
-
-  # ===========================================================================
-  # Deploy to Fly.io - Deploy preview app with the built image
-  # ===========================================================================
-  deploy-preview:
-    name: Deploy Preview App
-    needs: [security-check, setup, build-image, create-neon-branch, create-upstash-redis]
-    if: |
-      github.event.action != 'closed' &&
-      needs.security-check.outputs.is_approved == 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: pr-${{ github.event.number }}
-      url: ${{ steps.deploy.outputs.url }}
-    outputs:
-      url: ${{ steps.deploy.outputs.url }}
-      app_name: ${{ steps.app_name.outputs.name }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Generate app name
-        id: app_name
-        run: |
-          # Fly.io app names must be lowercase, alphanumeric with hyphens
-          # Max 63 characters
-          APP_NAME="metaculus-pr-${{ github.event.number }}"
-          echo "name=${APP_NAME}" >> $GITHUB_OUTPUT
-          echo "App name: ${APP_NAME}"
-
-      - name: Setup Fly.io CLI
-        uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Create or update Fly app
         id: deploy
@@ -384,8 +343,8 @@ jobs:
           
           # Set dynamic secrets (unique per PR - URLs and database connections)
           flyctl secrets set \
-            DATABASE_URL="${{ needs.create-neon-branch.outputs.db_url_with_pooler }}" \
-            REDIS_URL="${{ needs.create-upstash-redis.outputs.redis_url }}" \
+            DATABASE_URL="${{ steps.neon.outputs.db_url_with_pooler }}" \
+            REDIS_URL="${{ steps.redis.outputs.redis_url }}" \
             APP_DOMAIN="${APP_DOMAIN}" \
             PUBLIC_APP_URL="${PUBLIC_APP_URL}" \
             --app ${{ steps.app_name.outputs.name }} \
@@ -430,7 +389,7 @@ jobs:
   # ===========================================================================
   comment-on-pr:
     name: Comment on PR
-    needs: [security-check, setup, deploy-preview, create-neon-branch, create-upstash-redis]
+    needs: [security-check, setup, deploy-preview]
     if: |
       github.event.action != 'closed' &&
       needs.security-check.outputs.is_approved == 'true'
