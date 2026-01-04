@@ -284,37 +284,59 @@ jobs:
           UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
-          # Create Redis database via Upstash API (global DB with primary region)
-          RESPONSE=$(curl -s -X POST \
-            https://api.upstash.com/v2/redis/database \
-            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "name": "preview-pr-${{ github.event.number }}",
-              "region": "global",
-              "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
-              "tls": true
-            }')
+          REDIS_NAME="preview-pr-${{ github.event.number }}"
           
-          # Check for errors
-          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ Failed to create Redis database:"
-            echo "$RESPONSE" | jq '.error'
-            exit 1
+          # Check if database already exists
+          DATABASES=$(curl -s -X GET \
+            https://api.upstash.com/v2/redis/databases \
+            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          
+          # Search for existing database by name
+          if echo "$DATABASES" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")" 2>/dev/null || echo "")
+          else
+            EXISTING_DB=""
           fi
           
-          # Extract database details
-          DATABASE_ID=$(echo "$RESPONSE" | jq -r '.database_id')
-          ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
-          PORT=$(echo "$RESPONSE" | jq -r '.port')
-          PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+          if [ -n "$EXISTING_DB" ] && [ "$EXISTING_DB" != "null" ]; then
+            echo "✅ Found existing Redis database: ${REDIS_NAME}"
+            DATABASE_ID=$(echo "$EXISTING_DB" | jq -r '.database_id')
+            ENDPOINT=$(echo "$EXISTING_DB" | jq -r '.endpoint')
+            PORT=$(echo "$EXISTING_DB" | jq -r '.port')
+            PASSWORD=$(echo "$EXISTING_DB" | jq -r '.password')
+          else
+            echo "Creating new Redis database: ${REDIS_NAME}"
+            RESPONSE=$(curl -s -X POST \
+              https://api.upstash.com/v2/redis/database \
+              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "'"${REDIS_NAME}"'",
+                "region": "global",
+                "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
+                "tls": true
+              }')
+            
+            # Check for errors
+            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+              echo "❌ Failed to create Redis database:"
+              echo "$RESPONSE" | jq '.'
+              exit 1
+            fi
+            
+            DATABASE_ID=$(echo "$RESPONSE" | jq -r '.database_id')
+            ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
+            PORT=$(echo "$RESPONSE" | jq -r '.port')
+            PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+            echo "✅ Created new Redis database: ${REDIS_NAME}"
+          fi
           
           # Construct Redis URL and set as step output
           REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
           echo "database_id=${DATABASE_ID}" >> $GITHUB_OUTPUT
-          echo "redis_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          echo "redis_cache_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          echo "redis_mq_url=${REDIS_URL}" >> $GITHUB_OUTPUT
           
-          echo "✅ Created Upstash Redis database: preview-pr-${{ github.event.number }}"
           echo "Database ID: ${DATABASE_ID}"
           echo "Endpoint: ${ENDPOINT}"
 
@@ -344,7 +366,8 @@ jobs:
           # Set dynamic secrets (unique per PR - URLs and database connections)
           flyctl secrets set \
             DATABASE_URL="${{ steps.neon.outputs.db_url_with_pooler }}" \
-            REDIS_URL="${{ steps.redis.outputs.redis_url }}" \
+            REDIS_CACHE_URL="${{ steps.redis.outputs.redis_cache_url }}" \
+            REDIS_MQ_URL="${{ steps.redis.outputs.redis_mq_url }}" \
             APP_DOMAIN="${APP_DOMAIN}" \
             PUBLIC_APP_URL="${PUBLIC_APP_URL}" \
             --app ${{ steps.app_name.outputs.name }} \
