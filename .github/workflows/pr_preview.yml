@@ -36,7 +36,6 @@
 # Optional Variables:
 # -------------------
 # - FLY_ORG: Fly.io organization (defaults to 'personal')
-# - FLY_REGION: Fly.io region for deployment (defaults to 'iad')
 # - UPSTASH_REGION: Upstash Redis region (defaults to 'us-east-1')
 # =============================================================================
 
@@ -397,7 +396,6 @@ jobs:
           flyctl deploy \
             --app ${{ steps.app_name.outputs.name }} \
             --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }} \
-            --region ${{ vars.FLY_REGION || 'iad' }} \
             --ha=false \
             --now
 
