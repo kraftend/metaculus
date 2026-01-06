@@ -292,6 +292,7 @@ jobs:
               --name "${REDIS_NAME}" \
               --region "${REDIS_REGION}" \
               --no-replicas \
+              --enable-eviction \
               -o "${FLY_ORG}"
             echo "✅ Created new Redis database: ${REDIS_NAME}"
           fi
