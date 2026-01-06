@@ -125,7 +125,7 @@ jobs:
     needs: [setup, build-image]
     runs-on: ubuntu-latest
     environment:
-      name: staging
+      name: Staging
       url: ${{ steps.deploy.outputs.url }}
     outputs:
       url: ${{ steps.deploy.outputs.url }}
@@ -153,7 +153,7 @@ jobs:
           REDIS_REGION="${{ vars.FLY_REDIS_REGION || 'iad' }}"
           
           # Check if database already exists
-          if flyctl redis list -o "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "✅ Found existing Redis database: ${REDIS_NAME}"
           else
             echo "Creating new Redis database: ${REDIS_NAME}"
@@ -162,17 +162,16 @@ jobs:
               --region "${REDIS_REGION}" \
               --no-replicas \
               --enable-eviction \
-              -o "${FLY_ORG}"
+              --org "${FLY_ORG}"
             echo "✅ Created new Redis database: ${REDIS_NAME}"
           fi
           
-          # Get Redis connection URL from status
-          REDIS_STATUS=$(flyctl redis status "${REDIS_NAME}" -o "${FLY_ORG}" --json)
-          REDIS_URL=$(echo "$REDIS_STATUS" | jq -r '.private_url // .privateUrl // .url')
+          # Get Redis connection URL from status (parse text output)
+          REDIS_URL=$(flyctl redis status "${REDIS_NAME}" | grep -i "Private URL" | awk -F'= ' '{print $2}' | tr -d ' ')
           
-          if [ -z "$REDIS_URL" ] || [ "$REDIS_URL" == "null" ]; then
+          if [ -z "$REDIS_URL" ]; then
             echo "❌ Failed to get Redis URL from status"
-            echo "Status output: $REDIS_STATUS"
+            flyctl redis status "${REDIS_NAME}"
             exit 1
           fi
           

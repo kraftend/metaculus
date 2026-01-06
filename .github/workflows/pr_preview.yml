@@ -284,7 +284,7 @@ jobs:
           REDIS_REGION="${{ vars.FLY_REDIS_REGION || 'iad' }}"
           
           # Check if database already exists
-          if flyctl redis list -o "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "✅ Found existing Redis database: ${REDIS_NAME}"
           else
             echo "Creating new Redis database: ${REDIS_NAME}"
@@ -293,17 +293,16 @@ jobs:
               --region "${REDIS_REGION}" \
               --no-replicas \
               --enable-eviction \
-              -o "${FLY_ORG}"
+              --org "${FLY_ORG}"
             echo "✅ Created new Redis database: ${REDIS_NAME}"
           fi
           
-          # Get Redis connection URL from status
-          REDIS_STATUS=$(flyctl redis status "${REDIS_NAME}" -o "${FLY_ORG}" --json)
-          REDIS_URL=$(echo "$REDIS_STATUS" | jq -r '.private_url // .privateUrl // .url')
+          # Get Redis connection URL from status (parse text output)
+          REDIS_URL=$(flyctl redis status "${REDIS_NAME}" | grep -i "Private URL" | awk -F'= ' '{print $2}' | tr -d ' ')
           
-          if [ -z "$REDIS_URL" ] || [ "$REDIS_URL" == "null" ]; then
+          if [ -z "$REDIS_URL" ]; then
             echo "❌ Failed to get Redis URL from status"
-            echo "Status output: $REDIS_STATUS"
+            flyctl redis status "${REDIS_NAME}"
             exit 1
           fi
           
@@ -358,16 +357,11 @@ jobs:
           WORKER_COUNT=0
           CRON_COUNT=0
           
-          # Check for preview-worker label
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+          # Check for preview-workers label (enables both worker and cron)
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
             WORKER_COUNT=1
-            echo "📦 preview-worker label detected - scaling worker to 1"
-          fi
-          
-          # Check for preview-cron label
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
             CRON_COUNT=1
-            echo "⏰ preview-cron label detected - scaling cron to 1"
+            echo "📦 preview-workers label detected - scaling worker and cron to 1"
           fi
           
           echo "Scaling processes: app=1, worker=${WORKER_COUNT}, cron=${CRON_COUNT}"
@@ -401,16 +395,12 @@ jobs:
       - name: Determine process status
         id: process_status
         run: |
-          # Check labels for worker/cron
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+          # Check for preview-workers label (enables both worker and cron)
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
             echo "worker=✅ Running" >> $GITHUB_OUTPUT
-          else
-            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
-          fi
-          
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
             echo "cron=✅ Running" >> $GITHUB_OUTPUT
           else
+            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
             echo "cron=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
           fi
 
@@ -451,8 +441,7 @@ jobs:
             - The preview app will be automatically destroyed when this PR is closed
             - Both PostgreSQL and Redis are isolated from production data
             - Changes pushed to this PR will trigger a new deployment
-            - To enable background workers, add the `preview-worker` label
-            - To enable cron jobs, add the `preview-cron` label
+            - To enable background workers and cron jobs, add the `preview-workers` label
 
             </details>
 
@@ -489,9 +478,9 @@ jobs:
           REDIS_NAME="preview-pr-${{ github.event.number }}"
           FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
           
-          if flyctl redis list -o "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "Deleting Fly Redis database: ${REDIS_NAME}"
-            flyctl redis destroy "${REDIS_NAME}" -o "${FLY_ORG}" --confirm "${REDIS_NAME}"
+            flyctl redis destroy "${REDIS_NAME}" --yes
             echo "✅ Deleted Fly Redis database"
           else
             echo "ℹ️ Fly Redis database not found or already deleted"
@@ -576,9 +565,9 @@ jobs:
           REDIS_NAME="preview-pr-${{ github.event.number }}"
           FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
           
-          if flyctl redis list -o "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "Deleting Fly Redis database: ${REDIS_NAME}"
-            flyctl redis destroy "${REDIS_NAME}" -o "${FLY_ORG}" --confirm "${REDIS_NAME}"
+            flyctl redis destroy "${REDIS_NAME}" --yes
             echo "✅ Deleted Fly Redis database"
           else
             echo "ℹ️ Fly Redis database not found or already deleted"
