@@ -7,7 +7,7 @@
 # - Uses a fixed app name (metaculus-staging)
 # - Runs all processes (app, worker, cron)
 # - Uses NeonDB main branch (not ephemeral branch)
-# - Creates/reuses a persistent Upstash Redis database
+# - Creates/reuses a persistent Redis database via Fly.io CLI (managed Upstash)
 # - Never auto-stops machines
 #
 # Required Secrets:
@@ -20,14 +20,12 @@
 #       SENTRY_DSN=https://xxx@sentry.io/xxx
 # - NEON_PROJECT_ID: Your Neon project ID
 # - NEON_API_KEY: API key from Neon Console
-# - UPSTASH_EMAIL: Email for Upstash account
-# - UPSTASH_API_KEY: API key from Upstash Console
 #
 # Optional Variables:
 # -------------------
 # - FLY_ORG: Fly.io organization (defaults to 'personal')
 # - STAGING_APP_NAME: Fly app name (defaults to 'metaculus-staging')
-# - UPSTASH_REGION: Upstash Redis region (defaults to 'us-east-1')
+# - FLY_REDIS_REGION: Redis region for Fly.io managed Upstash (defaults to 'iad')
 # =============================================================================
 
 name: Staging Deployment
@@ -147,60 +145,40 @@ jobs:
           api_key: ${{ secrets.NEON_API_KEY }}
           username: neondb_owner
 
-      - name: Get Upstash Redis URL
+      - name: Get or Create Fly Redis Database
         id: redis
-        env:
-          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
-          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
           REDIS_NAME="metaculus-staging"
+          FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
+          REDIS_REGION="${{ vars.FLY_REDIS_REGION || 'iad' }}"
           
           # Check if database already exists
-          DATABASES=$(curl -s -X GET \
-            https://api.upstash.com/v2/redis/databases \
-            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
-          
-          # Search for existing database by name
-          if echo "$DATABASES" | jq -e 'type == "array"' > /dev/null 2>&1; then
-            EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")" 2>/dev/null || echo "")
-          else
-            EXISTING_DB=""
-          fi
-          
-          if [ -n "$EXISTING_DB" ] && [ "$EXISTING_DB" != "null" ]; then
+          if flyctl redis list -o "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "✅ Found existing Redis database: ${REDIS_NAME}"
-            ENDPOINT=$(echo "$EXISTING_DB" | jq -r '.endpoint')
-            PORT=$(echo "$EXISTING_DB" | jq -r '.port')
-            PASSWORD=$(echo "$EXISTING_DB" | jq -r '.password')
           else
             echo "Creating new Redis database: ${REDIS_NAME}"
-            RESPONSE=$(curl -s -X POST \
-              https://api.upstash.com/v2/redis/database \
-              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d '{
-                "name": "'"${REDIS_NAME}"'",
-                "region": "global",
-                "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
-                "tls": true
-              }')
-            
-            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-              echo "❌ Failed to create Redis database:"
-              echo "$RESPONSE" | jq '.'
-              exit 1
-            fi
-            
-            ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
-            PORT=$(echo "$RESPONSE" | jq -r '.port')
-            PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+            flyctl redis create \
+              --name "${REDIS_NAME}" \
+              --region "${REDIS_REGION}" \
+              --no-replicas \
+              -o "${FLY_ORG}"
             echo "✅ Created new Redis database: ${REDIS_NAME}"
           fi
           
-          # Construct Redis URL and set as step output
-          REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
+          # Get Redis connection URL from status
+          REDIS_STATUS=$(flyctl redis status "${REDIS_NAME}" -o "${FLY_ORG}" --json)
+          REDIS_URL=$(echo "$REDIS_STATUS" | jq -r '.private_url // .privateUrl // .url')
+          
+          if [ -z "$REDIS_URL" ] || [ "$REDIS_URL" == "null" ]; then
+            echo "❌ Failed to get Redis URL from status"
+            echo "Status output: $REDIS_STATUS"
+            exit 1
+          fi
+          
+          # Set outputs
           echo "redis_cache_url=${REDIS_URL}" >> $GITHUB_OUTPUT
           echo "redis_mq_url=${REDIS_URL}" >> $GITHUB_OUTPUT
+          echo "Redis URL retrieved successfully"
 
       - name: Deploy to staging
         id: deploy
@@ -258,7 +236,7 @@ jobs:
           echo "| 🌐 **URL** | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 📦 **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🗄️ **PostgreSQL** | NeonDB main branch |" >> $GITHUB_STEP_SUMMARY
-          echo "| ⚡ **Redis** | Upstash \`metaculus-staging\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚡ **Redis** | Fly Redis \`metaculus-staging\` |" >> $GITHUB_STEP_SUMMARY
           echo "| 🔖 **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Processes" >> $GITHUB_STEP_SUMMARY
