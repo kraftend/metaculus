@@ -5,7 +5,7 @@
 # This workflow creates ephemeral preview environments for pull requests:
 # 1. Builds Docker image and pushes to GitHub Container Registry (ghcr.io)
 # 2. Creates a NeonDB database branch for isolated PostgreSQL
-# 3. Creates an Upstash Redis database for isolated caching
+# 3. Creates a Redis database via Fly.io CLI (managed Upstash) for isolated caching
 # 4. Deploys the preview app to Fly.io
 # 5. Cleans up resources when PR is closed
 #
@@ -24,8 +24,6 @@
 # - NEON_PROJECT_ID: Your Neon project ID (found in Neon Console project settings)
 # - NEON_API_KEY: API key from Neon Console (https://console.neon.tech/app/settings/api-keys)
 # - FLY_API_TOKEN: API token from Fly.io (run `fly tokens create deploy`)
-# - UPSTASH_EMAIL: Email for Upstash account
-# - UPSTASH_API_KEY: API key from Upstash Console (https://console.upstash.com/account/api)
 # - FLY_PREVIEW_SECRETS: Multi-line secret containing all app secrets in KEY=value format
 #     Example:
 #       SECRET_KEY=django-secret-key-here
@@ -36,7 +34,7 @@
 # Optional Variables:
 # -------------------
 # - FLY_ORG: Fly.io organization (defaults to 'personal')
-# - UPSTASH_REGION: Upstash Redis region (defaults to 'us-east-1')
+# - FLY_REDIS_REGION: Redis region for Fly.io managed Upstash (defaults to 'iad')
 # =============================================================================
 
 name: PR Preview Environment
@@ -248,7 +246,7 @@ jobs:
       needs.security-check.outputs.is_approved == 'true'
     runs-on: ubuntu-latest
     environment:
-      name: pr-${{ github.event.number }}
+      name: Preview
       url: ${{ steps.deploy.outputs.url }}
     outputs:
       url: ${{ steps.deploy.outputs.url }}
@@ -278,67 +276,40 @@ jobs:
           api_key: ${{ secrets.NEON_API_KEY }}
           username: neondb_owner
 
-      - name: Create Upstash Redis Database
+      - name: Create or Get Fly Redis Database
         id: redis
-        env:
-          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
-          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
           REDIS_NAME="preview-pr-${{ github.event.number }}"
+          FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
+          REDIS_REGION="${{ vars.FLY_REDIS_REGION || 'iad' }}"
           
           # Check if database already exists
-          DATABASES=$(curl -s -X GET \
-            https://api.upstash.com/v2/redis/databases \
-            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
-          
-          # Search for existing database by name
-          if echo "$DATABASES" | jq -e 'type == "array"' > /dev/null 2>&1; then
-            EXISTING_DB=$(echo "$DATABASES" | jq -r ".[] | select(.database_name == \"${REDIS_NAME}\")" 2>/dev/null || echo "")
-          else
-            EXISTING_DB=""
-          fi
-          
-          if [ -n "$EXISTING_DB" ] && [ "$EXISTING_DB" != "null" ]; then
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
             echo "✅ Found existing Redis database: ${REDIS_NAME}"
-            DATABASE_ID=$(echo "$EXISTING_DB" | jq -r '.database_id')
-            ENDPOINT=$(echo "$EXISTING_DB" | jq -r '.endpoint')
-            PORT=$(echo "$EXISTING_DB" | jq -r '.port')
-            PASSWORD=$(echo "$EXISTING_DB" | jq -r '.password')
           else
             echo "Creating new Redis database: ${REDIS_NAME}"
-            RESPONSE=$(curl -s -X POST \
-              https://api.upstash.com/v2/redis/database \
-              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d '{
-                "name": "'"${REDIS_NAME}"'",
-                "region": "global",
-                "primary_region": "${{ vars.UPSTASH_REGION || 'us-east-1' }}",
-                "tls": true
-              }')
-            
-            # Check for errors
-            if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-              echo "❌ Failed to create Redis database:"
-              echo "$RESPONSE" | jq '.'
-              exit 1
-            fi
-            
-            DATABASE_ID=$(echo "$RESPONSE" | jq -r '.database_id')
-            ENDPOINT=$(echo "$RESPONSE" | jq -r '.endpoint')
-            PORT=$(echo "$RESPONSE" | jq -r '.port')
-            PASSWORD=$(echo "$RESPONSE" | jq -r '.password')
+            flyctl redis create \
+              --name "${REDIS_NAME}" \
+              --region "${REDIS_REGION}" \
+              --no-replicas \
+              --enable-eviction \
+              --org "${FLY_ORG}"
             echo "✅ Created new Redis database: ${REDIS_NAME}"
           fi
           
-          # Construct Redis URL and set as step output
-          REDIS_URL="rediss://:${PASSWORD}@${ENDPOINT}:${PORT}"
-          echo "database_id=${DATABASE_ID}" >> $GITHUB_OUTPUT
+          # Get Redis connection URL from status (parse text output)
+          REDIS_URL=$(flyctl redis status "${REDIS_NAME}" | grep -i "Private URL" | awk -F'= ' '{print $2}' | tr -d ' ')
+          
+          if [ -z "$REDIS_URL" ]; then
+            echo "❌ Failed to get Redis URL from status"
+            flyctl redis status "${REDIS_NAME}"
+            exit 1
+          fi
+          
+          # Set outputs
           echo "redis_cache_url=${REDIS_URL}" >> $GITHUB_OUTPUT
           echo "redis_mq_url=${REDIS_URL}" >> $GITHUB_OUTPUT
-          
-          echo "Database ID: ${DATABASE_ID}"
-          echo "Endpoint: ${ENDPOINT}"
+          echo "Redis URL retrieved successfully"
 
       - name: Create or update Fly app
         id: deploy
@@ -386,16 +357,11 @@ jobs:
           WORKER_COUNT=0
           CRON_COUNT=0
           
-          # Check for preview-worker label
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+          # Check for preview-workers label (enables both worker and cron)
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
             WORKER_COUNT=1
-            echo "📦 preview-worker label detected - scaling worker to 1"
-          fi
-          
-          # Check for preview-cron label
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
             CRON_COUNT=1
-            echo "⏰ preview-cron label detected - scaling cron to 1"
+            echo "📦 preview-workers label detected - scaling worker and cron to 1"
           fi
           
           echo "Scaling processes: app=1, worker=${WORKER_COUNT}, cron=${CRON_COUNT}"
@@ -429,16 +395,12 @@ jobs:
       - name: Determine process status
         id: process_status
         run: |
-          # Check labels for worker/cron
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-worker') }}" == "true" ]]; then
+          # Check for preview-workers label (enables both worker and cron)
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
             echo "worker=✅ Running" >> $GITHUB_OUTPUT
-          else
-            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
-          fi
-          
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-cron') }}" == "true" ]]; then
             echo "cron=✅ Running" >> $GITHUB_OUTPUT
           else
+            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
             echo "cron=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
           fi
 
@@ -458,7 +420,7 @@ jobs:
             | 🌐 **Preview App** | ${{ needs.deploy-preview.outputs.url }} |
             | 📦 **Docker Image** | `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}` |
             | 🗄️ **PostgreSQL** | NeonDB branch `preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}` |
-            | ⚡ **Redis** | Upstash `preview-pr-${{ github.event.number }}` |
+            | ⚡ **Redis** | Fly Redis `preview-pr-${{ github.event.number }}` |
 
             ### Processes
             | Process | Status |
@@ -479,8 +441,7 @@ jobs:
             - The preview app will be automatically destroyed when this PR is closed
             - Both PostgreSQL and Redis are isolated from production data
             - Changes pushed to this PR will trigger a new deployment
-            - To enable background workers, add the `preview-worker` label
-            - To enable cron jobs, add the `preview-cron` label
+            - To enable background workers and cron jobs, add the `preview-workers` label
 
             </details>
 
@@ -511,35 +472,28 @@ jobs:
           branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
           api_key: ${{ secrets.NEON_API_KEY }}
 
-      - name: Delete Upstash Redis Database
+      - name: Delete Fly Redis Database
         continue-on-error: true
-        env:
-          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
-          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
-          # First, list databases to find the one for this PR
-          DATABASES=$(curl -s -X GET \
-            https://api.upstash.com/v2/redis/databases \
-            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          REDIS_NAME="preview-pr-${{ github.event.number }}"
+          FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
           
-          # Find database ID by name
-          DATABASE_ID=$(echo "$DATABASES" | jq -r '.[] | select(.database_name == "preview-pr-${{ github.event.number }}") | .database_id')
-          
-          if [ -n "$DATABASE_ID" ] && [ "$DATABASE_ID" != "null" ]; then
-            echo "Deleting Upstash Redis database: preview-pr-${{ github.event.number }} (ID: ${DATABASE_ID})"
-            curl -s -X DELETE \
-              "https://api.upstash.com/v2/redis/database/${DATABASE_ID}" \
-              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}"
-            echo "✅ Deleted Upstash Redis database"
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+            echo "Deleting Fly Redis database: ${REDIS_NAME}"
+            flyctl redis destroy "${REDIS_NAME}" --yes
+            echo "✅ Deleted Fly Redis database"
           else
-            echo "ℹ️ Upstash Redis database not found or already deleted"
+            echo "ℹ️ Fly Redis database not found or already deleted"
           fi
 
-      - name: Delete GitHub Environment
+      - name: Delete PR Deployments from Preview Environment
+        continue-on-error: true
         uses: strumwolf/delete-deployment-environment@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          environment: pr-${{ github.event.number }}
+          environment: Preview
+          onlyRemoveDeployments: true
+          ref: refs/pull/${{ github.event.number }}/merge
 
       - name: Find existing comment
         uses: peter-evans/find-comment@v3
@@ -565,7 +519,7 @@ jobs:
             | 🌐 Preview App | ✅ Deleted |
             | 🗄️ PostgreSQL Branch | ✅ Deleted |
             | ⚡ Redis Database | ✅ Deleted |
-            | 🔧 GitHub Environment | ✅ Deleted |
+            | 🔧 GitHub Deployments | ✅ Removed |
             | 📦 Docker Image | ⚠️ Retained (auto-cleanup via GHCR policies) |
 
             ---
@@ -605,35 +559,28 @@ jobs:
           branch: preview/pr-${{ github.event.number }}-${{ steps.branch_name.outputs.current_branch }}
           api_key: ${{ secrets.NEON_API_KEY }}
 
-      - name: Delete Upstash Redis Database
+      - name: Delete Fly Redis Database
         continue-on-error: true
-        env:
-          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
-          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
-          # First, list databases to find the one for this PR
-          DATABASES=$(curl -s -X GET \
-            https://api.upstash.com/v2/redis/databases \
-            -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}")
+          REDIS_NAME="preview-pr-${{ github.event.number }}"
+          FLY_ORG="${{ vars.FLY_ORG || 'personal' }}"
           
-          # Find database ID by name
-          DATABASE_ID=$(echo "$DATABASES" | jq -r '.[] | select(.database_name == "preview-pr-${{ github.event.number }}") | .database_id')
-          
-          if [ -n "$DATABASE_ID" ] && [ "$DATABASE_ID" != "null" ]; then
-            echo "Deleting Upstash Redis database: preview-pr-${{ github.event.number }} (ID: ${DATABASE_ID})"
-            curl -s -X DELETE \
-              "https://api.upstash.com/v2/redis/database/${DATABASE_ID}" \
-              -u "${UPSTASH_EMAIL}:${UPSTASH_API_KEY}"
-            echo "✅ Deleted Upstash Redis database"
+          if flyctl redis list --org "${FLY_ORG}" | grep -q "${REDIS_NAME}"; then
+            echo "Deleting Fly Redis database: ${REDIS_NAME}"
+            flyctl redis destroy "${REDIS_NAME}" --yes
+            echo "✅ Deleted Fly Redis database"
           else
-            echo "ℹ️ Upstash Redis database not found or already deleted"
+            echo "ℹ️ Fly Redis database not found or already deleted"
           fi
 
-      - name: Delete GitHub Environment
+      - name: Delete PR Deployments from Preview Environment
+        continue-on-error: true
         uses: strumwolf/delete-deployment-environment@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          environment: pr-${{ github.event.number }}
+          environment: Preview
+          onlyRemoveDeployments: true
+          ref: refs/pull/${{ github.event.number }}/merge
 
       - name: Find existing comment
         uses: peter-evans/find-comment@v3
