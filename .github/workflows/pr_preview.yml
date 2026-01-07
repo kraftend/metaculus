@@ -311,6 +311,18 @@ jobs:
           echo "redis_mq_url=${REDIS_URL}" >> $GITHUB_OUTPUT
           echo "Redis URL retrieved successfully"
 
+      - name: Select Fly config file
+        id: fly_config
+        run: |
+          # Select config file based on preview-workers label
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
+            echo "config_file=fly.toml" >> $GITHUB_OUTPUT
+            echo "📦 preview-workers label detected - using full config (app + worker + cron)"
+          else
+            echo "config_file=fly.minimal.toml" >> $GITHUB_OUTPUT
+            echo "🌐 Using minimal config (app only)"
+          fi
+
       - name: Create or update Fly app
         id: deploy
         run: |
@@ -344,30 +356,14 @@ jobs:
             --app ${{ steps.app_name.outputs.name }} \
             --stage
 
-          # Deploy using the pre-built image
-          # VM memory/cpu settings are defined per-process in fly.toml
+          # Deploy using the pre-built image and selected config file
+          # Config file determines which processes are created (app only vs app+worker+cron)
           flyctl deploy \
             --app ${{ steps.app_name.outputs.name }} \
+            --config ${{ steps.fly_config.outputs.config_file }} \
             --image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }} \
             --ha=false \
             --now
-
-          # Scale processes based on PR labels
-          # By default, only run app process in previews (worker/cron are expensive and rarely needed)
-          WORKER_COUNT=0
-          CRON_COUNT=0
-          
-          # Check for preview-workers label (enables both worker and cron)
-          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
-            WORKER_COUNT=1
-            CRON_COUNT=1
-            echo "📦 preview-workers label detected - scaling worker and cron to 1"
-          fi
-          
-          echo "Scaling processes: app=1, worker=${WORKER_COUNT}, cron=${CRON_COUNT}"
-          flyctl scale count app=1 worker=${WORKER_COUNT} cron=${CRON_COUNT} \
-            --app ${{ steps.app_name.outputs.name }} \
-            --yes
 
           # Output the app URL for other jobs
           echo "url=${PUBLIC_APP_URL}" >> $GITHUB_OUTPUT
@@ -395,13 +391,15 @@ jobs:
       - name: Determine process status
         id: process_status
         run: |
-          # Check for preview-workers label (enables both worker and cron)
+          # Check for preview-workers label (determines which config file was used)
           if [[ "${{ contains(github.event.pull_request.labels.*.name, 'preview-workers') }}" == "true" ]]; then
             echo "worker=✅ Running" >> $GITHUB_OUTPUT
             echo "cron=✅ Running" >> $GITHUB_OUTPUT
+            echo "config=fly.toml" >> $GITHUB_OUTPUT
           else
-            echo "worker=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
-            echo "cron=⏸️ Scaled to 0" >> $GITHUB_OUTPUT
+            echo "worker=❌ Not deployed" >> $GITHUB_OUTPUT
+            echo "cron=❌ Not deployed" >> $GITHUB_OUTPUT
+            echo "config=fly.minimal.toml" >> $GITHUB_OUTPUT
           fi
 
       - name: Create or update comment
@@ -434,6 +432,9 @@ jobs:
             - **Branch:** `${{ needs.setup.outputs.branch }}`
             - **Fly App:** `${{ needs.deploy-preview.outputs.app_name }}`
 
+            ### Configuration
+            - **Config File:** `${{ steps.process_status.outputs.config }}`
+
             ---
             <details>
             <summary>ℹ️ Preview Environment Info</summary>
@@ -441,7 +442,8 @@ jobs:
             - The preview app will be automatically destroyed when this PR is closed
             - Both PostgreSQL and Redis are isolated from production data
             - Changes pushed to this PR will trigger a new deployment
-            - To enable background workers and cron jobs, add the `preview-workers` label
+            - To deploy with background workers and cron jobs, add the `preview-workers` label (uses `fly.toml`)
+            - Without the label, only the web app is deployed (uses `fly.minimal.toml`)
 
             </details>
 
