@@ -42,6 +42,8 @@ async function handleProxyRequest(request: NextRequest, method: string) {
   const apiPath = url.pathname.replace("/api-proxy/", "/api/");
   const targetUrl = `${PUBLIC_API_BASE_URL}${apiPath}${url.search}`;
 
+  const initialHeaders = request.headers.entries();
+
   const blocklistHeaders = [
     "cookie", // properly pass user session to Django API from proxy endpoint
     "host", // ensure paginated requests return proper url in next and prev properties
@@ -79,6 +81,13 @@ async function handleProxyRequest(request: NextRequest, method: string) {
   if (alphaToken) {
     requestHeaders.set("x-alpha-auth-token", alphaToken);
   }
+
+  console.log({
+    requestUrl: request.url,
+    targetUrl: targetUrl,
+    initialHeaders: initialHeaders,
+    modifiedHeaders: requestHeaders.entries(),
+  });
 
   const response = await fetch(targetUrl, {
     method,
