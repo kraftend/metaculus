@@ -396,7 +396,7 @@ ALLOWED_HOSTS = [
     "127.0.0.1",
     "host.docker.internal",
     "dev-metaculus-web-023b332df454.herokuapp.com/",  # remove after we have a DNS entry for dev environment
-    "*.fly.dev", # allow all fly.dev domains for preview environments, remove after we have a wildcard DNS entry for preview environments
+    ".fly.dev", # allow all fly.dev domains for preview environments, remove after we have a wildcard DNS entry for preview environments
 ]
 
 CSRF_TRUSTED_ORIGINS = [PUBLIC_APP_URL]
