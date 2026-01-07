@@ -493,7 +493,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           environment: Preview
           onlyRemoveDeployments: true
-          ref: refs/pull/${{ github.event.number }}/merge
+          ref: ${{ github.head_ref }}
 
       - name: Find existing comment
         uses: peter-evans/find-comment@v3
@@ -580,7 +580,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           environment: Preview
           onlyRemoveDeployments: true
-          ref: refs/pull/${{ github.event.number }}/merge
+          ref: ${{ github.head_ref }}
 
       - name: Find existing comment
         uses: peter-evans/find-comment@v3
